@@ -1,7 +1,7 @@
 env="StarCraft2v2"
 map="10gen_protoss"
 algo="mat"
-units="5v5"
+units="5v6"
 
 exp="mat_smacv2_${map}_${units}"
 seed_max=3

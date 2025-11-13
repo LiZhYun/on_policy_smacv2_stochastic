@@ -6,12 +6,12 @@ from smacv2.env.multiagentenv import MultiAgentEnv
 
 from smacv2.env.starcraft2.maps import get_map_params
 
+
 import atexit
 from warnings import warn
 from operator import attrgetter
 from copy import deepcopy
 import numpy as np
-import random
 import enum
 import math
 from absl import logging
@@ -63,8 +63,6 @@ class Direction(enum.IntEnum):
 
 EPS = 1e-7
 
-class CannotResetException(Exception):
-    pass
 
 class StarCraft2Env(MultiAgentEnv):
     """The StarCraft II environment for decentralised multi-agent
@@ -113,11 +111,11 @@ class StarCraft2Env(MultiAgentEnv):
         heuristic_ai=False,
         heuristic_rest=False,
         debug=False,
-        prob_obs_enemy=0.0,
-        action_mask=True,
+        state_agent_id=True,
     ):
         """
         Create a StarCraftC2Env environment.
+
         Parameters
         ----------
         map_name : str, optional
@@ -211,7 +209,6 @@ class StarCraft2Env(MultiAgentEnv):
             Log messages about observations, state, actions and rewards for
             debugging purposes (default is False).
         """
-
         # Map arguments
         self.map_name = map_name
         map_params = get_map_params(self.map_name)
@@ -237,6 +234,7 @@ class StarCraft2Env(MultiAgentEnv):
             self.obs_own_health = True
         self.n_obs_pathing = 8
         self.n_obs_height = 9
+        self.state_agent_id = state_agent_id
 
         # Rewards args
         self.reward_sparse = reward_sparse
@@ -287,8 +285,6 @@ class StarCraft2Env(MultiAgentEnv):
             if not self.replace_teammates
             else self.capability_config["team_gen"]["n_enemies"]
         )
-        self.prob_obs_enemy = prob_obs_enemy
-        self.action_mask = action_mask
         self.random_start = "start_positions" in self.capability_config
         self.conic_fov = conic_fov
         self.n_fov_actions = num_fov_actions if self.conic_fov else 0
@@ -312,13 +308,7 @@ class StarCraft2Env(MultiAgentEnv):
         self.n_actions_move = 4
 
         self.n_actions_no_attack = self.n_actions_move + self.n_fov_actions + 2
-        if (
-            map_params["map_type"] in ["MMM", "terran_gen"]
-            and self.n_agents > self.n_enemies
-        ):
-            self.n_actions = self.n_actions_no_attack + self.n_agents
-        else:
-            self.n_actions = self.n_actions_no_attack + self.n_enemies
+        self.n_actions = self.n_actions_no_attack + self.n_enemies
 
         # Map info
         self._agent_race = map_params["a_race"]
@@ -341,12 +331,24 @@ class StarCraft2Env(MultiAgentEnv):
 
         # create lists containing the names of attributes returned in states
         self.ally_state_attr_names = [
-            "health",
-            "energy/cooldown",
+            "visible",
+            "distance",
             "rel_x",
             "rel_y",
+            "energy/cooldown",
+            "center_x",
+            "center_y",
+            "health",
         ]
-        self.enemy_state_attr_names = ["health", "rel_x", "rel_y"]
+        self.enemy_state_attr_names = [
+            "available", 
+            "distance", 
+            "rel_x", 
+            "rel_y", 
+            "visible", 
+            "center_x", 
+            "center_y", 
+            "health", ]
 
         if self.shield_bits_ally > 0:
             self.ally_state_attr_names += ["shield"]
@@ -375,8 +377,6 @@ class StarCraft2Env(MultiAgentEnv):
         self._episode_steps = 0
         self._total_steps = 0
         self._obs = None
-        self.obs_enemies = None
-        self.enemy_tags = None
         self.battles_won = 0
         self.battles_game = 0
         self.timeouts = 0
@@ -460,10 +460,9 @@ class StarCraft2Env(MultiAgentEnv):
         )
         self._controller.create_game(create)
 
-        self.game = sc_pb.RequestJoinGame(
+        join = sc_pb.RequestJoinGame(
             race=races[self._agent_race], options=interface_options
         )
-        join = self.game
         self._controller.join_game(join)
 
         game_info = self._controller.game_info()
@@ -497,7 +496,7 @@ class StarCraft2Env(MultiAgentEnv):
                 np.flip(
                     np.transpose(
                         np.array(
-                            list(map_info.pathing_grid.data), dtype=bool
+                            list(map_info.pathing_grid.data), dtype=np.bool
                         ).reshape(self.map_x, self.map_y)
                     ),
                     axis=1,
@@ -547,8 +546,6 @@ class StarCraft2Env(MultiAgentEnv):
         self.mask_enemies = self.enemy_mask is not None
         ally_team = episode_config.get("team_gen", {}).get("ally_team", None)
         enemy_team = episode_config.get("team_gen", {}).get("enemy_team", None)
-        self.obs_enemies = np.zeros((self.n_enemies, self.n_agents))
-        self.enemy_tags = [None for i in range(self.n_enemies)]
         self.death_tracker_ally = np.zeros(self.n_agents)
         self.death_tracker_enemy = np.zeros(self.n_enemies)
         self.fov_directions = np.zeros((self.n_agents, 2))
@@ -581,7 +578,9 @@ class StarCraft2Env(MultiAgentEnv):
                     60, "*"
                 )
             )
-        return self.get_obs(), self.get_state()
+        
+        global_state = np.array([self.get_state_agent(agent_id) for agent_id in range(self.n_agents)])
+        return self.get_obs(), global_state # self.get_state()
 
     def _restart(self):
         """Restart the environment by killing all units on the map.
@@ -634,6 +633,7 @@ class StarCraft2Env(MultiAgentEnv):
         req_actions = sc_pb.RequestAction(actions=sc_actions)
 
         try:
+
             if self.conic_fov:
                 self.render_fovs()
             self._controller.actions(req_actions)
@@ -667,16 +667,9 @@ class StarCraft2Env(MultiAgentEnv):
         for _al_id, al_unit in self.agents.items():
             if al_unit.health == 0:
                 dead_allies += 1
-                for e in range(self.n_enemies):
-                    if self.enemy_tags[e] == _al_id:
-                        self.enemy_tags[e] = None
-                        self.obs_enemies[e, :] = 0
-                        self.obs_enemies[:, _al_id] = 0
         for _e_id, e_unit in self.enemies.items():
             if e_unit.health == 0:
                 dead_enemies += 1
-                self.enemy_tags[_e_id] = None
-                self.obs_enemies[_e_id, :] = 0
 
         info["dead_allies"] = dead_allies
         info["dead_enemies"] = dead_enemies
@@ -813,13 +806,11 @@ class StarCraft2Env(MultiAgentEnv):
             )
             if self.debug:
                 logging.debug("Agent {}: Move West".format(a_id))
-
         elif self.conic_fov and action in range(6, 6 + self.n_fov_actions):
             self.fov_directions[a_id] = self.canonical_fov_directions[
                 action - 6
             ]
             cmd = None
-
         else:
             # attack/heal units that are in range
             target_id = action - self.n_actions_no_attack
@@ -844,18 +835,12 @@ class StarCraft2Env(MultiAgentEnv):
             action_id = actions[action_name]
             target_tag = target_unit.tag
 
-            can_shoot = self.get_can_shoot(a_id, target_unit)
-
-            if can_shoot:
-                cmd = r_pb.ActionRawUnitCommand(
-                    ability_id=action_id,
-                    target_unit_tag=target_tag,
-                    unit_tags=[tag],
-                    queue_command=False,
-                )
-
-            else:
-                return None
+            cmd = r_pb.ActionRawUnitCommand(
+                ability_id=action_id,
+                target_unit_tag=target_tag,
+                unit_tags=[tag],
+                queue_command=False,
+            )
 
             if self.debug:
                 logging.debug(
@@ -936,6 +921,7 @@ class StarCraft2Env(MultiAgentEnv):
             self.heuristic_rest
             and self.get_avail_agent_actions(a_id)[action_num] == 0
         ):
+
             # Move towards the target rather than attacking/healing
             if unit.unit_type == self.medivac_id:
                 target_unit = self.agents[self.heuristic_targets[a_id]]
@@ -1113,7 +1099,6 @@ class StarCraft2Env(MultiAgentEnv):
         """Save a replay."""
         prefix = self.replay_prefix or self.map_name
         replay_dir = self.replay_dir or ""
-        prefix = prefix + "_" + str(self.prob_obs_enemy)
         replay_path = self._run_config.save_replay(
             self._controller.save_replay(),
             replay_dir=replay_dir,
@@ -1377,7 +1362,9 @@ class StarCraft2Env(MultiAgentEnv):
         `health_level` between `0` and `1` where the agent dies if its
         proportional health (`health / health_max`) is below that level.
         This function rescales health to take into account this death level.
+
         In the proportional health scale we have something that looks like this:
+
         -------------------------------------------------------------
         0                                                            1
                   ^ health_level            ^ proportional_health
@@ -1463,6 +1450,7 @@ class StarCraft2Env(MultiAgentEnv):
 
     def get_obs_agent(self, agent_id, fully_observable=False):
         """Returns observation for agent_id. The observation is composed of:
+
         - agent movement features (where it can move to, height information
             and pathing grid)
         - enemy features (available_to_attack, health, relative_x, relative_y,
@@ -1470,20 +1458,24 @@ class StarCraft2Env(MultiAgentEnv):
         - ally features (visible, distance, relative_x, relative_y, shield,
             unit_type)
         - agent unit features (health, shield, unit_type)
+
         All of this information is flattened and concatenated into a list,
         in the aforementioned order. To know the sizes of each of the
         features inside the final list of features, take a look at the
         functions ``get_obs_move_feats_size()``,
         ``get_obs_enemy_feats_size()``, ``get_obs_ally_feats_size()`` and
         ``get_obs_own_feats_size()``.
+
         The size of the observation vector may vary, depending on the
         environment configuration and type of units present in the map.
         For instance, non-Protoss units will not have shields, movement
         features may or may not include terrain height and pathing grid,
         unit_type is not included if there is only one type of unit in the
         map etc.).
+
         NOTE: Agents should have access only to their local observations
         during decentralised execution.
+
         fully_observable: -- ignores sight range for a particular unit.
         For Debugging purposes ONLY -- not a fair observation.
         """
@@ -1509,7 +1501,6 @@ class StarCraft2Env(MultiAgentEnv):
             # Movement features. Do not need similar for looking
             # around because this is always possible
             avail_actions = self.get_avail_agent_actions(agent_id)
-            true_avail_actions = self.get_true_avail_agent_actions(agent_id)
             for m in range(self.n_actions_move):
                 move_feats[m] = avail_actions[m + 2]
 
@@ -1534,22 +1525,11 @@ class StarCraft2Env(MultiAgentEnv):
                     if self.conic_fov
                     else dist < sight_range
                 )
-                if enemy_visible:
-                    if self.enemy_tags[e_id] is None:
-                        self.obs_enemies[e_id, agent_id] = 1
-                        self.enemy_tags[e_id] = agent_id
-                        for a_id in range(self.n_agents):
-                            if a_id != agent_id:
-                                draw = np.random.rand()
-                                if draw < self.prob_obs_enemy:
-                                    self.obs_enemies[e_id, a_id] = 1
-                if self.obs_enemies[e_id, agent_id] == 0:
-                    enemy_visible = False
                 if (enemy_visible and e_unit.health > 0) or (
                     e_unit.health > 0 and fully_observable
                 ):  # visible and alive
                     # Sight range > shoot range
-                    enemy_feats[e_id, 0] = true_avail_actions[
+                    enemy_feats[e_id, 0] = avail_actions[
                         self.n_actions_no_attack + e_id
                     ]  # available
                     enemy_feats[e_id, 1] = dist / sight_range  # distance
@@ -1580,13 +1560,12 @@ class StarCraft2Env(MultiAgentEnv):
                         type_id = self.get_unit_type_id(e_unit, False)
                         enemy_feats[e_id, ind + type_id] = 1  # unit type
 
-                if self.obs_enemies[e_id, agent_id] == 0:
-                    enemy_feats = np.zeros(enemy_feats_dim, dtype=np.float32)
             # Ally features
             al_ids = [
                 al_id for al_id in range(self.n_agents) if al_id != agent_id
             ]
             for i, al_id in enumerate(al_ids):
+
                 al_unit = self.get_unit_by_id(al_id)
                 al_x = al_unit.pos.x
                 al_y = al_unit.pos.y
@@ -1678,13 +1657,9 @@ class StarCraft2Env(MultiAgentEnv):
             if self.conic_fov:
                 own_feats[ind : ind + 2] = self.fov_directions[agent_id]
                 ind += 2
-            # own_feats[ind] = self.unit_shoot_range(agent_id)
-            # ind += 1
             if self.unit_type_bits > 0:
                 type_id = self.get_unit_type_id(unit, True)
                 own_feats[ind + type_id] = 1
-                ind += self.unit_type_bits
-
         if self.obs_starcraft:
             agent_obs = np.concatenate(
                 (
@@ -1718,18 +1693,248 @@ class StarCraft2Env(MultiAgentEnv):
 
         return agent_obs
 
+    def get_state_agent(self, agent_id):
+        """Returns the global state.
+        NOTE: This function should not be used during decentralised execution.
+        """
+        if self.obs_instead_of_state:
+            obs_concat = np.concatenate(self.get_obs(), axis=0).astype(
+                np.float32
+            )
+            return obs_concat
+
+        unit = self.get_unit_by_id(agent_id)
+
+        move_feats_dim = self.get_obs_move_feats_size()
+        enemy_feats_dim = self.get_enemy_num_attributes()
+        ally_feats_dim = self.get_ally_num_attributes()
+        own_feats_dim = self.get_state_own_feats_size()
+
+        move_feats = np.zeros(move_feats_dim, dtype=np.float32)
+        enemy_feats = np.zeros((self.n_enemies, enemy_feats_dim), dtype=np.float32)
+        ally_feats = np.zeros(((self.n_agents - 1), ally_feats_dim), dtype=np.float32)
+        own_feats = np.zeros(own_feats_dim, dtype=np.float32)
+        agent_id_feats = np.zeros(self.n_agents, dtype=np.float32)
+
+        center_x = self.map_x / 2
+        center_y = self.map_y / 2
+
+        if unit.health > 0:  # otherwise dead, return all zeros
+            x = unit.pos.x
+            y = unit.pos.y
+            sight_range = self.unit_sight_range(agent_id)
+
+            # Movement features. Do not need similar for looking
+            # around because this is always possible
+            avail_actions = self.get_avail_agent_actions(agent_id)
+            for m in range(self.n_actions_move):
+                move_feats[m] = avail_actions[m + 2]
+
+            ind = self.n_actions_move
+
+            if self.obs_pathing_grid:
+                move_feats[
+                    ind : ind + self.n_obs_pathing  # noqa
+                ] = self.get_surrounding_pathing(unit)
+                ind += self.n_obs_pathing
+
+            if self.obs_terrain_height:
+                move_feats[ind:] = self.get_surrounding_height(unit)
+
+            # Enemy features
+            for e_id, e_unit in self.enemies.items():
+                e_x = e_unit.pos.x
+                e_y = e_unit.pos.y
+                dist = self.distance(x, y, e_x, e_y)
+                enemy_visible = (
+                    self.is_position_in_cone(agent_id, e_unit.pos)
+                    if self.conic_fov
+                    else dist < sight_range
+                )
+                if e_unit.health > 0 or (
+                    e_unit.health > 0 and fully_observable
+                ):  # visible and alive
+                    # Sight range > shoot range
+                    enemy_feats[e_id, 0] = avail_actions[
+                        self.n_actions_no_attack + e_id
+                    ]  # available
+                    enemy_feats[e_id, 1] = dist / sight_range  # distance
+                    enemy_feats[e_id, 2] = (
+                        e_x - x
+                    ) / sight_range  # relative X
+                    enemy_feats[e_id, 3] = (
+                        e_y - y
+                    ) / sight_range  # relative Y
+                    show_enemy = (
+                        self.mask_enemies
+                        and not self.enemy_mask[agent_id][e_id]
+                    ) or not self.mask_enemies
+                    enemy_feats[e_id, 4] = enemy_visible  # visible
+                    ind = 5
+
+                    enemy_feats[e_id, ind] = (e_x - center_x) / self.max_distance_x  # center X
+                    enemy_feats[e_id, ind+1] = (e_y - center_y) / self.max_distance_y  # center Y
+                    ind += 2
+
+                    if self.obs_all_health and show_enemy:
+                        enemy_feats[e_id, ind] = (
+                            e_unit.health / e_unit.health_max
+                        )  # health
+                        ind += 1
+                        if self.shield_bits_enemy > 0:
+                            max_shield = self.unit_max_shield(e_unit)
+                            enemy_feats[e_id, ind] = (
+                                e_unit.shield / max_shield
+                            )  # shield
+                            ind += 1
+
+                    if self.unit_type_bits > 0 and show_enemy:
+                        type_id = self.get_unit_type_id(e_unit, False)
+                        enemy_feats[e_id, ind + type_id] = 1  # unit type
+
+
+            # Ally features
+            al_ids = [
+                al_id for al_id in range(self.n_agents) if al_id != agent_id
+            ]
+            for i, al_id in enumerate(al_ids):
+
+                al_unit = self.get_unit_by_id(al_id)
+                al_x = al_unit.pos.x
+                al_y = al_unit.pos.y
+                dist = self.distance(x, y, al_x, al_y)
+                ally_visible = (
+                    self.is_position_in_cone(agent_id, al_unit.pos)
+                    if self.conic_fov
+                    else dist < sight_range
+                )
+                if al_unit.health > 0:  # visible and alive
+                    ally_feats[i, 0] = ally_visible  # visible
+                    ally_feats[i, 1] = dist / sight_range  # distance
+                    ally_feats[i, 2] = (al_x - x) / sight_range  # relative X
+                    ally_feats[i, 3] = (al_y - y) / sight_range  # relative Y
+
+                    max_cd = self.unit_max_cooldown(al_unit)
+                    if (
+                        self.map_type in ["MMM", "terran_gen"]
+                        and al_unit.unit_type == self.medivac_id
+                    ):
+                        ally_feats[i, 4] = al_unit.energy / max_cd  # energy
+                    else:
+                        ally_feats[i, 4] = (
+                            al_unit.weapon_cooldown / max_cd
+                        )  # cooldown
+
+                    ind = 5
+                    ally_feats[i, ind] = (al_x - center_x) / self.max_distance_x  # center X
+                    ally_feats[i, ind+1] = (al_y - center_y) / self.max_distance_y  # center Y
+                    ind += 2
+
+                    if self.obs_all_health:
+                        if not self.stochastic_health:
+                            ally_feats[i, ind] = (
+                                al_unit.health / al_unit.health_max
+                            )  # health
+                            ind += 1
+                        elif self.observe_teammate_health:
+                            ally_feats[i, ind] = self._compute_health(
+                                agent_id=al_id, unit=al_unit
+                            )
+                            ind += 1
+                        elif self.zero_pad_health:
+                            ind += 1
+                        if self.shield_bits_ally > 0:
+                            max_shield = self.unit_max_shield(al_unit)
+                            ally_feats[i, ind] = (
+                                al_unit.shield / max_shield
+                            )  # shield
+                            ind += 1
+                    if self.stochastic_attack and self.observe_attack_probs:
+                        ally_feats[i, ind] = self.agent_attack_probabilities[
+                            al_id
+                        ]
+                        ind += 1
+                    elif (
+                        self.stochastic_attack
+                        and self.zero_pad_stochastic_attack
+                    ):
+                        ind += 1
+
+                    if self.stochastic_health and self.observe_teammate_health:
+                        ally_feats[i, ind] = self.agent_health_levels[al_id]
+                        ind += 1
+                    elif self.stochastic_health and self.zero_pad_health:
+                        ind += 1
+                    if self.unit_type_bits > 0 and (
+                        not self.replace_teammates
+                        or self.observe_teammate_types
+                    ):
+                        type_id = self.get_unit_type_id(al_unit, True)
+                        ally_feats[i, ind + type_id] = 1
+                        ind += self.unit_type_bits
+                    elif self.unit_type_bits > 0 and self.zero_pad_unit_types:
+                        ind += self.unit_type_bits
+                    if self.obs_last_action:
+                        ally_feats[i, ind:] = self.last_action[al_id]
+
+            # Own features
+            ind = 0
+            if self.obs_own_health:
+                if not self.stochastic_health:
+                    own_feats[ind] = unit.health / unit.health_max
+                else:
+                    own_feats[ind] = self._compute_health(agent_id, unit)
+                ind += 1
+                if self.shield_bits_ally > 0:
+                    max_shield = self.unit_max_shield(unit)
+                    own_feats[ind] = unit.shield / max_shield
+                    ind += 1
+
+            own_feats[ind] = (x - center_x) / self.max_distance_x  # center X
+            own_feats[ind+1] = (y - center_y) / self.max_distance_y  # center Y
+            ind += 2
+
+            if self.stochastic_attack:
+                own_feats[ind] = self.agent_attack_probabilities[agent_id]
+                ind += 1
+            if self.stochastic_health:
+                own_feats[ind] = self.agent_health_levels[agent_id]
+                ind += 1
+            if self.obs_own_pos:
+                own_feats[ind] = x / self.map_x
+                own_feats[ind + 1] = y / self.map_y
+                ind += 2
+            if self.conic_fov:
+                own_feats[ind : ind + 2] = self.fov_directions[agent_id]
+                ind += 2
+            if self.unit_type_bits > 0:
+                type_id = self.get_unit_type_id(unit, True)
+                own_feats[ind + type_id] = 1
+
+        state = np.concatenate((ally_feats.flatten(), 
+                                enemy_feats.flatten(),
+                                move_feats.flatten(),
+                                own_feats.flatten()))
+
+        # Agent id features
+        if self.state_agent_id:
+            agent_id_feats[agent_id] = 1.
+            state = np.append(state, agent_id_feats.flatten())
+
+        if self.state_timestep_number:
+            state = np.append(state, self._episode_steps / self.episode_limit)
+
+        return state
+
     def get_obs(self):
         """Returns all agent observations in a list.
         NOTE: Agents should have access only to their local observations
         during decentralised execution.
         """
-        agents = list(range(self.n_agents))
-        random.shuffle(agents)
-        agents_obs = [None for i in range(len(agents))]
-        for agent in agents:
-            agents_obs[agent] = self.get_obs_agent(
-                agent, fully_observable=self.fully_observable
-            )
+        agents_obs = [
+            self.get_obs_agent(i, fully_observable=self.fully_observable)
+            for i in range(self.n_agents)
+        ]
         return agents_obs
 
     def get_capabilities_agent(self, agent_id):
@@ -1776,6 +1981,7 @@ class StarCraft2Env(MultiAgentEnv):
             state = np.append(state, state_dict["last_action"].flatten())
         if "timestep" in state_dict:
             state = np.append(state, state_dict["timestep"])
+        
 
         state = state.astype(dtype=np.float32)
 
@@ -1798,10 +2004,12 @@ class StarCraft2Env(MultiAgentEnv):
 
     def get_state_dict(self):
         """Returns the global state as a dictionary.
+
         - allies: numpy array containing agents and their attributes
         - enemies: numpy array containing enemies and their attributes
         - last_action: numpy array of previous actions for each agent
         - timestep: current no. of steps divided by total no. of steps
+
         NOTE: This function should not be used during decentralised execution.
         """
 
@@ -1937,6 +2145,10 @@ class StarCraft2Env(MultiAgentEnv):
             own_feats += 2
         return own_feats
 
+    def get_state_own_feats_size(self):
+        own_feats = self.get_obs_own_feats_size() + 2
+        return own_feats
+
     def get_obs_move_feats_size(self):
         """Returns the size of the vector containing the agents's movement-
         related features.
@@ -1985,36 +2197,62 @@ class StarCraft2Env(MultiAgentEnv):
 
         enemy_feats = n_enemies * n_enemy_feats
         ally_feats = n_allies * n_ally_feats
-        if self.obs_starcraft:
-            return (
-                self.obs_timestep_number
-                + move_feats
-                + enemy_feats
-                + ally_feats
-                + own_feats
-            )
-        else:
-            return 1 if self.obs_timestep_number else 0
+
+        all_feats = move_feats + enemy_feats + ally_feats + own_feats
+
+        timestep_feats = 0
+        if self.obs_timestep_number:
+            timestep_feats = 1
+            all_feats += timestep_feats
+
+        return [all_feats, [n_allies, n_ally_feats], [n_enemies, n_enemy_feats], [1, move_feats], [1, own_feats+timestep_feats]]
+
 
     def get_state_size(self):
         """Returns the size of the global state."""
         if self.obs_instead_of_state:
-            return self.get_obs_size() * self.n_agents
+            return self.get_obs_size()[0] * self.n_agents
+            
+        own_feats = self.get_state_own_feats_size()
+        move_feats = self.get_obs_move_feats_size()
 
-        nf_al = self.get_ally_num_attributes()
-        nf_en = self.get_enemy_num_attributes()
+        n_enemy_feats = self.get_enemy_num_attributes()
+        n_ally_feats = self.get_ally_num_attributes()
 
-        enemy_state = self.n_enemies * nf_en
-        ally_state = self.n_agents * nf_al
+        enemy_feats = self.n_enemies * n_enemy_feats
+        n_allies = self.n_agents - 1
+        ally_feats = n_allies * n_ally_feats
 
-        size = enemy_state + ally_state
+        all_feats = move_feats + enemy_feats + ally_feats + own_feats
 
-        if self.state_last_action:
-            size += self.n_agents * self.n_actions
+        agent_id_feats = 0
+        timestep_feats = 0
+
+        if self.state_agent_id:
+            agent_id_feats = self.n_agents
+            all_feats += agent_id_feats
+
         if self.state_timestep_number:
-            size += 1
+            timestep_feats = 1
+            all_feats += timestep_feats
 
-        return size
+        return [all_feats, [n_allies, n_ally_feats], [self.n_enemies, n_enemy_feats], [1, move_feats], [1, own_feats+agent_id_feats+timestep_feats]]
+
+        
+        # nf_al = self.get_ally_num_attributes()
+        # nf_en = self.get_enemy_num_attributes()
+
+        # enemy_state = self.n_enemies * nf_en
+        # ally_state = self.n_agents * nf_al
+
+        # size = enemy_state + ally_state
+
+        # if self.state_last_action:
+        #     size += self.n_agents * self.n_actions
+        # if self.state_timestep_number:
+        #     size += 1
+
+        # return size
 
     def get_visibility_matrix(self):
         """Returns a boolean numpy array of dimensions
@@ -2023,7 +2261,7 @@ class StarCraft2Env(MultiAgentEnv):
         """
         arr = np.zeros(
             (self.n_agents, self.n_agents + self.n_enemies),
-            dtype=bool,
+            dtype=np.bool,
         )
 
         for agent_id in range(self.n_agents):
@@ -2157,87 +2395,6 @@ class StarCraft2Env(MultiAgentEnv):
                     for (t_id, t_unit) in self.agents.items()
                     if t_unit.unit_type != self.medivac_id
                 ]
-
-            # should we only be able to target people in the cone?
-            for t_id, t_unit in target_items:
-                if t_unit.health > 0:
-                    if not self.action_mask:
-                        avail_actions[t_id + self.n_actions_no_attack] = 1
-                    else:
-                        dist = self.distance(
-                            unit.pos.x, unit.pos.y, t_unit.pos.x, t_unit.pos.y
-                        )
-                        can_shoot = (
-                            dist <= shoot_range
-                            if not self.conic_fov
-                            else self.is_position_in_cone(
-                                agent_id, t_unit.pos, range="shoot_range"
-                            )
-                        )
-
-                        if can_shoot:
-                            avail_actions[t_id + self.n_actions_no_attack] = 1
-
-            return avail_actions
-
-        else:
-            return [1] + [0] * (self.n_actions - 1)
-
-    def get_can_shoot(self, agent_id, t_unit):
-        unit = self.get_unit_by_id(agent_id)
-        dist = self.distance(
-            unit.pos.x, unit.pos.y, t_unit.pos.x, t_unit.pos.y
-        )
-        shoot_range = self.unit_shoot_range(agent_id)
-        can_shoot = (
-            dist <= shoot_range
-            if not self.conic_fov
-            else self.is_position_in_cone(
-                agent_id, t_unit.pos, range="shoot_range"
-            )
-        )
-        return can_shoot
-
-    def get_true_avail_agent_actions(self, agent_id):
-        """Returns the available actions for agent_id."""
-        unit = self.get_unit_by_id(agent_id)
-        if unit.health > 0:
-            # cannot choose no-op when alive
-            avail_actions = [0] * self.n_actions
-
-            # stop should be allowed
-            avail_actions[1] = 1
-
-            # see if we can move
-            if self.can_move(unit, Direction.NORTH):
-                avail_actions[2] = 1
-            if self.can_move(unit, Direction.SOUTH):
-                avail_actions[3] = 1
-            if self.can_move(unit, Direction.EAST):
-                avail_actions[4] = 1
-            if self.can_move(unit, Direction.WEST):
-                avail_actions[5] = 1
-
-            if self.conic_fov:
-                avail_actions[6 : 6 + self.n_fov_actions] = [
-                    1
-                ] * self.n_fov_actions
-
-            # Can attack only alive units that are alive in the shooting range
-            shoot_range = self.unit_shoot_range(agent_id)
-
-            target_items = self.enemies.items()
-            if (
-                self.map_type in ("MMM", "terran_gen")
-                and unit.unit_type == self.medivac_id
-            ):
-                # Medivacs cannot heal themselves or other flying units
-                target_items = [
-                    (t_id, t_unit)
-                    for (t_id, t_unit) in self.agents.items()
-                    if t_unit.unit_type != self.medivac_id
-                ]
-
             # should we only be able to target people in the cone?
             for t_id, t_unit in target_items:
                 if t_unit.health > 0:
@@ -2251,13 +2408,13 @@ class StarCraft2Env(MultiAgentEnv):
                             agent_id, t_unit.pos, range="shoot_range"
                         )
                     )
-
                     if can_shoot:
                         avail_actions[t_id + self.n_actions_no_attack] = 1
 
             return avail_actions
 
         else:
+            # only no-op allowed
             return [1] + [0] * (self.n_actions - 1)
 
     def get_avail_actions(self):
@@ -2375,7 +2532,7 @@ class StarCraft2Env(MultiAgentEnv):
             except (protocol.ProtocolError, protocol.ConnectionError):
                 self.full_restart()
                 self.reset(episode_config=episode_config)
-        for i in range(1000):
+        while True:
             # Sometimes not all units have yet been created by SC2
             self.agents = {}
             self.enemies = {}
@@ -2436,8 +2593,6 @@ class StarCraft2Env(MultiAgentEnv):
             except (protocol.ProtocolError, protocol.ConnectionError):
                 self.full_restart()
                 self.reset(episode_config=episode_config)
-        # probably had some error when spawning
-        raise CannotResetException("waited for units to spawn and they didn't")
 
     def get_unit_types(self):
         if self._unit_types is None:
@@ -2554,9 +2709,6 @@ class StarCraft2Env(MultiAgentEnv):
             if self.map_type == "marines":
                 self.marine_id = min_unit_type
                 self._register_unit_mapping("marine", min_unit_type)
-                self.marine_id = self._min_unit_type + 4
-                self.ally_unit_map = {"marine": self.marine_id}
-                self.enemy_unit_map = {"marine": Terran.Marine}
             elif self.map_type == "stalkers_and_zealots":
                 self.stalker_id = min_unit_type
                 self._register_unit_mapping("stalker", min_unit_type)

@@ -20,16 +20,21 @@ class SMACv2(StarCraftCapabilityEnvWrapper):
     def seed(self, seed):
         random.seed(seed)
         np.random.seed(seed)
+    
+    def repeat(self, a):
+        return [a for _ in range(self.n_agents)]
 
     def reset(self):
         obs, state = super().reset()
+        state = self.repeat(self.env.get_state())
         avail_actions = [self.get_avail_agent_actions(i) for i in range(self.env.n_agents)]
         return obs, state, avail_actions
 
     def step(self, actions):
         reward, terminated, info = super().step(actions)
         local_obs = self.get_obs()
-        global_state = np.array([self.env.get_state_agent(agent_id) for agent_id in range(self.env.n_agents)])
+        # global_state = np.array([self.env.get_state_agent(agent_id) for agent_id in range(self.env.n_agents)])
+        global_state = self.repeat(self.env.get_state())
         rewards = [[reward]] * self.env.n_agents
 
         dones = []
